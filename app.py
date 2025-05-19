@@ -1,73 +1,62 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from pydantic import BaseModel
 import numpy as np
 import tensorflow as tf
 from transformers import AutoTokenizer
+from typing import List
 
 app = FastAPI()
 
-# Load the tokenizer
+# Load tokenizer once (efficient and reused)
 tokenizer = AutoTokenizer.from_pretrained("./tokenizer", local_files_only=True)
 
-# Load TFLite models
-interpreter_cls = tf.lite.Interpreter(model_path="./model_cls.tflite")
-interpreter_event = tf.lite.Interpreter(model_path="./model_event.tflite")
-interpreter_task = tf.lite.Interpreter(model_path="./model_task.tflite")
-interpreter_device = tf.lite.Interpreter(model_path="./model_device.tflite")
-
-# Allocate tensors
-interpreter_cls.allocate_tensors()
-interpreter_event.allocate_tensors()
-interpreter_task.allocate_tensors()
-interpreter_device.allocate_tensors()
+# Helper to load TFLite model on demand
+def load_interpreter(model_path: str):
+    interpreter = tf.lite.Interpreter(model_path=model_path)
+    interpreter.allocate_tensors()
+    return interpreter
 
 class TextInput(BaseModel):
     text: str
+
+def prepare_inputs(text: str):
+    tokens = tokenizer(text, return_tensors="np", padding="max_length", truncation=True, max_length=128)
+    return {
+        "input_ids": tokens["input_ids"].astype(np.int32),
+        "attention_mask": tokens["attention_mask"].astype(np.int32),
+        "token_type_ids": tokens["token_type_ids"].astype(np.int32),
+    }
 
 def run_tflite_model(interpreter, inputs_dict):
     input_details = interpreter.get_input_details()
     output_details = interpreter.get_output_details()
 
-    # Set inputs
     for detail in input_details:
-        key = detail["name"]
-        if "input_ids" in key:
+        name = detail["name"]
+        if "input_ids" in name:
             interpreter.set_tensor(detail["index"], inputs_dict["input_ids"])
-        elif "attention_mask" in key:
+        elif "attention_mask" in name:
             interpreter.set_tensor(detail["index"], inputs_dict["attention_mask"])
-        elif "token_type_ids" in key:
+        elif "token_type_ids" in name:
             interpreter.set_tensor(detail["index"], inputs_dict["token_type_ids"])
 
-    # Run inference
     interpreter.invoke()
+    return [interpreter.get_tensor(out["index"]) for out in output_details]
 
-    # Get outputs
-    return [interpreter.get_tensor(output["index"]) for output in output_details]
-
-def predict_label_tflite(text):
-    tokens = tokenizer(text, return_tensors="np", padding="max_length", truncation=True, max_length=128)
-    inputs = {
-        "input_ids": tokens["input_ids"].astype(np.int32),
-        "attention_mask": tokens["attention_mask"].astype(np.int32),
-        "token_type_ids": tokens["token_type_ids"].astype(np.int32),
-    }
-
-    outputs = run_tflite_model(interpreter_cls, inputs)
+def predict_label(text: str) -> int:
+    inputs = prepare_inputs(text)
+    interpreter = load_interpreter("./model_cls.tflite")
+    outputs = run_tflite_model(interpreter, inputs)
     probs = tf.nn.softmax(outputs[0], axis=-1).numpy()
     return int(np.argmax(probs))
 
-def run_token_classification_tflite(interpreter, text):
-    tokens = tokenizer(text, return_tensors="np", padding="max_length", truncation=True, max_length=128)
-    inputs = {
-        "input_ids": tokens["input_ids"].astype(np.int32),
-        "attention_mask": tokens["attention_mask"].astype(np.int32),
-        "token_type_ids": tokens["token_type_ids"].astype(np.int32),
-    }
-
+def token_classification(text: str, model_path: str) -> List:
+    inputs = prepare_inputs(text)
+    interpreter = load_interpreter(model_path)
     outputs = run_tflite_model(interpreter, inputs)
-    logits = outputs[0]  # Shape: (1, 128, num_labels)
-    predictions = np.argmax(logits, axis=-1)[0]
 
+    logits = outputs[0]  # shape: (1, 128, num_labels)
+    predictions = np.argmax(logits, axis=-1)[0]
     input_ids = inputs["input_ids"][0]
     tokens_list = tokenizer.convert_ids_to_tokens(input_ids)
 
@@ -81,17 +70,17 @@ def run_token_classification_tflite(interpreter, text):
 @app.post("/predict")
 async def predict(input: TextInput):
     text = input.text
+    label = predict_label(text)
 
-    label = predict_label_tflite(text)
     if label == 0:
         model_used = "EVENT"
-        result = run_token_classification_tflite(interpreter_event, text)
+        result = token_classification(text, "./model_event.tflite")
     elif label == 1:
-        model_used = "Device"
-        result = run_token_classification_tflite(interpreter_device, text)
+        model_used = "DEVICE"
+        result = token_classification(text, "./model_device.tflite")
     else:
         model_used = "TASK"
-        result = run_token_classification_tflite(interpreter_task, text)
+        result = token_classification(text, "./model_task.tflite")
 
     return {
         "model_used": model_used,
