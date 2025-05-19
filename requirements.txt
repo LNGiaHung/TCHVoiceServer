@@ -1,5 +1,5 @@
 fastapi
 uvicorn
 numpy
-tensorflow==2.15.0  # or lower if needed
-transformers==4.38.0  # match tokenizer version
+tensorflow
+transformers
